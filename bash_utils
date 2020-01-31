@@ -1,0 +1,175 @@
+#!/bin/env bash
+
+# general ########
+
+ansi() { echo -e "\e[${1}m${@:2}\e[0m"; }
+
+red() { ansi 31 "$@"; }
+error() { red $@ >&2; }
+info() { echo -e "$@"; }
+
+strip() { awk -F"[$@]" '{ print $2 }'; }
+exists() { hash $@; } >/dev/null 2>&1
+sethome() { mkdir $@; cd $@; } >/dev/null 2>&1
+lowercase() { for e in $@; do echo $e | tr '[:upper:]' '[:lower:]'; done; }
+uppercase() { for e in $@; do echo $(tr '[:lower:]' '[:upper:]' <<< ${e:0:1})${e:1}; done; }
+join() { echo "$*"; }
+explode() { echo $@; }
+savevars() { for var in "$@"; do printf '%s="%s";' "${var}" "${!var}"; done; }
+
+function contains() {
+    local target="$1"; shift; local list="$@"
+    for e in ${list}; do
+        [ "$e" == "${target}" ] && return 0
+    done; return 1
+}
+
+function chars() {
+    local i=0 str="$@"
+    while [ $i -lt ${#str} ]; do
+        echo "${str:$(( i++ )):1}"
+    done
+}
+
+function oneliner() {
+    awk '{
+        gsub(/^[ \t]+|[ \t]+$/, "");
+        gsub(/\\/, "\\\\"); gsub(/"/, "\\\"");
+        gsub(/\*/, "\\*");
+        printf "%s\\n", $0
+    }'
+}
+
+function scriptc() {
+    [ "${varpname}" ] || varpname="progname"
+    gcc -x c - -o $@ <<< '
+        #include <stdlib.h>
+        #include <stdio.h>
+        #include <string.h>
+
+        #define _asprintf(buf, ...) {   \
+            buf = realloc(buf, snprintf(NULL, 0, ##__VA_ARGS__) + sizeof(*buf));   \
+            sprintf(buf, ##__VA_ARGS__);  \
+        }
+
+        int main(int argc, char *argv[]) {
+            int len = 0, slen = 0;
+            char script[] = "'"$(oneliner)"'";
+            char *c = NULL, *args = NULL;
+            char **p = argv, *progname = *argv;
+            char delimitor[] = " ";
+            char varpname[] = "'"${varpname}"'";
+
+            while (*++p) {
+                char *t[] = { *p, delimitor };
+                for (int i = 0; i < sizeof(t) / sizeof(*t); i++) {
+                    slen = strlen(t[i]);
+                    memcpy((args = realloc(args, len + slen)) + len, t[i], slen + 1);
+                    len += slen;
+                }
+            }
+
+            _asprintf(c, "%s=%s; params=\"%s\"; set -- ${params}; \n%s",
+                      varpname, progname, args ? args : "", script);
+            return system(c);
+        }
+    '; unset varpname
+}
+
+# import exists
+function searchexec() {
+    local targets="$@"
+
+    [ "${within}" ] || for t in "${targets}"; do
+        exists ${t} && { echo ${t}; return; }
+    done
+
+    function pathopts() {
+        not=""; for path in "$@"; do
+            case ${path} in
+                '') ;;
+                'not') not='-prune -o' ;;
+                *) ( IFS=$':'; printf -- ' -path "%s" '"${not}" ${path}; ) ;;
+            esac
+        done
+    }
+
+    [[ ${within} ]] || within='/'
+    local searchpath="$(${__eval__} printenv PATH)"
+    eval `printf -- "%s find %s -mount %s -type f '(' %s -false ')' -print -quit " \
+            "${__eval__}" "${within}" "$(pathopts "${include}" not "${searchpath}" "${exclude}")" \
+            "$(printf -- '-name "%s" -o ' ${targets})"` | head -n1
+
+    unset within include exclude
+} 2>/dev/null
+
+# networking #####
+
+# import contains explode
+function ifaddr() {
+    local level sel
+    local opts='-br' intf state
+    local ipaddr mask
+    local macaddr props
+
+    function propset() {
+        local arg warg narg
+
+        while (( $# > 0 )); do
+            arg="$1"
+            if contains ${arg} "${warg}"; then
+                shift; eval ${arg}="$1"
+            elif contains ${arg} "${narg}"; then
+                eval ${arg}=true
+            fi; shift
+        done
+    }
+
+    while (( $# > 0 )); do
+        case "$1" in
+            -s) shift; sel="$1" ;;
+            -f|-family)
+                shift; opts+=" -f $1" ;;
+            -l|-level)
+                shift; level="$1" ;;
+            -*) opts+=" $1" ;;
+            *)  break ;;
+        esac; shift
+    done
+
+    case ${sel} in
+        macaddr|props) level="link" ;;
+        proto|metric|-)
+                       level="route" ;;
+        ipaddr|mask|*) level="addr" ;;
+    esac
+
+    case ${level} in
+        route)
+            while read line; do
+                local default=false
+                narg="default" warg="via dev proto scope metric" propset ${line}
+
+                case ${sel} in
+                    -) ${default} && echo ${dev} || continue ;;
+                    *) echo ${!sel} ;;
+                esac
+            done < <(ip ${opts} ${level} show) ;;
+        *)
+            for intf in $@; do
+                read intf state addrs < <(ip ${opts} ${level} show ${intf})
+                case ${level} in
+                    addr)
+                        for addr in ${addrs}; do
+                            IFS=$'/' read ipaddr mask <<< "${addr}"
+                            echo ${!sel}
+                        done ;;
+                    link)
+                        read macaddr props <<< "${addrs}"
+                        read props < <(IFS=$',' explode $(awk -F '[><]' '{ print $2 }' <<< "${props}"))
+                        echo ${!sel} ;;
+                    *)  return 1 ;;
+                esac
+            done ;;
+    esac
+}
